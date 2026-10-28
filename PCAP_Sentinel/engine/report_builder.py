@@ -1,46 +1,15 @@
-"""TASK 3 - Report builder: turn the context + rule findings into the JSON the dashboard displays.
 
-WHERE IT FITS
-    rule findings --> build_report(context, findings) --> report --> templates/index.html
+"""TASK 3 - Report builder: turn context and rule findings into a dashboard report."""
 
-IMPORTANT DESIGN RULE: this file must work for ANY rule - including rules that do not exist yet. Never write code
-that mentions a specific rule. You only normalise the shared finding format (see engine/default_rules/base_rule.py).
-
-A FINDING (what each rule returns) has: rule_id, name, category, severity, confidence, classification, summary,
-explanation, evidence (list), stats (dict), source_ips, destination_ips, source_ports, destination_ports, protocol,
-first_seen / last_seen (epoch seconds or None), window_seconds, packet_numbers, packet_count, recommendation,
-limitations, false_positive_risk, thresholds.
-    severity       one of SEVERITIES        (how bad if real)
-    confidence     one of CONFIDENCES       (how strong the evidence is)
-    classification one of CLASSIFICATIONS   (observed fact / suspicious indicator / inferred attack type)
-
-THE REPORT you must return (this is the contract with the dashboard):
-    schema_version  "2.0"                     generated_at   ISO UTC text
-    capture         copy of summary["capture"]  (app.py adds the filename afterwards)
-    headline        one sentence. With findings: "N finding(s) for review: 2 High, 1 Low." Without findings the text
-                    must say that this does NOT prove the capture is benign (tests look for the words "does not prove").
-    counts          {"findings": N, "by_severity": {every severity: count}, "by_classification": {every class: count}}
-    observations    list from build_observations()
-    statistics      the whole summary dict
-    findings        normalised findings, most severe first, ties by earliest time; ids "F1", "F2", ... AFTER sorting
-    rules_run       context.get("rules_run", [])        rule_errors  context.get("rule_errors", [])
-    processing_errors context.get("processing_errors", [])         limitations  list(STATIC_LIMITATIONS)
-The whole report must survive json.dumps (sets, bytes etc. are not JSON): the provided _jsonable() cleans it up.
-
-HOW YOU KNOW YOU ARE DONE
-    python -m unittest tests.test_student_tasks.Task3ReportBuilder -v
-    python -m unittest tests.test_framework.ReportBuilderTests -v
-"""
-from __future__ import annotations
-
-from collections import Counter   # noqa: F401
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 SEVERITIES = ("High", "Medium", "Low", "Informational")
 CONFIDENCES = ("High", "Medium", "Low")
 CLASSIFICATIONS = ("observed", "indicator", "inferred")
-SEVERITY_ORDER = {name: i for i, name in enumerate(SEVERITIES)}     # High -> 0 ... Informational -> 3
+
+SEVERITY_ORDER = {name: i for i, name in enumerate(SEVERITIES)}
 
 STATIC_LIMITATIONS = [
     "No findings does not mean a capture is safe: this is a rule-based educational detector covering a documented set of common behaviours, not a full IDS.",
@@ -51,7 +20,7 @@ STATIC_LIMITATIONS = [
 
 
 def _jsonable(value: Any) -> Any:
-    """PROVIDED. Make a structure JSON-safe (sets -> lists, bytes -> a short placeholder, odd objects -> text)."""
+    """Convert values into types that JSON can represent."""
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
@@ -60,64 +29,326 @@ def _jsonable(value: Any) -> Any:
         return f"<{len(value)} bytes>"
     if isinstance(value, float) and value != value:
         return None
-    return value if isinstance(value, (str, int, float, bool)) or value is None else str(value)
+    if isinstance(value, float) and value in (float("inf"), float("-inf")):
+        return None
+    return (
+        value
+        if isinstance(value, (str, int, float, bool)) or value is None
+        else str(value)
+    )
 
 
 def _utc(timestamp: Optional[float]) -> Optional[str]:
-    """PROVIDED. Epoch seconds -> ISO-8601 UTC text (None stays None)."""
+    """Convert epoch seconds into an ISO-8601 UTC timestamp."""
     if timestamp is None:
         return None
+
     try:
-        return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
-    except (OverflowError, OSError, ValueError):
+        return datetime.fromtimestamp(
+            float(timestamp), tz=timezone.utc
+        ).isoformat()
+    except (TypeError, OverflowError, OSError, ValueError):
         return None
 
 
-def normalise_finding(raw: dict, start: Optional[float], number: int) -> dict:
-    """Make one finding safe for the dashboard.
+def _elapsed(timestamp: Optional[float],
+             start: Optional[float]) -> Optional[float]:
+    """Return seconds after capture start, or None if unavailable."""
+    if timestamp is None or start is None:
+        return None
 
-    Receives: ``raw`` (a finding), ``start`` (epoch time of the first packet, or None), ``number`` (1-based).
-    Returns:  a NEW dict (do not modify ``raw``) with
-        * severity not in SEVERITIES  -> "Low";  confidence not in CONFIDENCES -> "Low";  classification not in
-          CLASSIFICATIONS -> "indicator". Every repair adds a sentence to a list stored in item["normalisation_notes"]
-          (that list is always present, empty when nothing was repaired).
-        * every missing key filled with a harmless default (empty list / dict / string, None) so the dashboard never
-          crashes on a sloppy rule. packet_count defaults to len(packet_numbers).
-        * first_seen / last_seen REMOVED and replaced by first_seen_elapsed / last_seen_elapsed (seconds since ``start``,
-          rounded to 3 places; None when either value is unavailable - never 0) and first_seen_utc / last_seen_utc.
-        * item["id"] = f"F{number}".
-    TODO  Implement the above. (Sorting happens in build_report; you may keep a temporary sort key in the dict, but
-          remove it before returning the final report.)
-    """
-    raise NotImplementedError("TODO (Task 3): normalise_finding()")
+    try:
+        return round(float(timestamp) - float(start), 3)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def normalise_finding(
+    raw: dict,
+    start: Optional[float],
+    number: int,
+) -> dict:
+    """Fill missing finding fields and repair invalid values."""
+    item = dict(raw)
+    notes = list(item.get("normalisation_notes") or [])
+
+    # Repair invalid severity.
+    if item.get("severity") not in SEVERITIES:
+        item["severity"] = "Low"
+        notes.append("Invalid or missing severity was changed to Low.")
+
+    # Repair invalid confidence.
+    if item.get("confidence") not in CONFIDENCES:
+        item["confidence"] = "Low"
+        notes.append("Invalid or missing confidence was changed to Low.")
+
+    # Repair invalid classification.
+    if item.get("classification") not in CLASSIFICATIONS:
+        item["classification"] = "indicator"
+        notes.append(
+            "Invalid or missing classification was changed to indicator."
+        )
+
+    # Provide safe defaults for fields used by the dashboard.
+    defaults = {
+        "rule_id": "",
+        "name": "",
+        "category": "",
+        "summary": "",
+        "explanation": "",
+        "evidence": [],
+        "stats": {},
+        "source_ips": [],
+        "destination_ips": [],
+        "source_ports": [],
+        "destination_ports": [],
+        "protocol": "",
+        "window_seconds": None,
+        "packet_numbers": [],
+        "packet_count": None,
+        "recommendation": "",
+        "limitations": [],
+        "false_positive_risk": "",
+        "thresholds": {},
+    }
+
+    for key, default in defaults.items():
+        if key not in item or item[key] is None:
+            item[key] = default.copy() if isinstance(default, (list, dict)) else default
+
+    # Keep packet_count consistent when it was not supplied.
+    if item["packet_count"] is None:
+        try:
+            item["packet_count"] = len(item["packet_numbers"])
+        except TypeError:
+            item["packet_count"] = 0
+
+    # Normalise the two timestamps before removing the original fields.
+    first_seen = item.get("first_seen")
+    last_seen = item.get("last_seen")
+
+    item["first_seen_elapsed"] = _elapsed(first_seen, start)
+    item["last_seen_elapsed"] = _elapsed(last_seen, start)
+    item["first_seen_utc"] = _utc(first_seen)
+    item["last_seen_utc"] = _utc(last_seen)
+
+    item.pop("first_seen", None)
+    item.pop("last_seen", None)
+
+    item["id"] = f"F{number}"
+    item["normalisation_notes"] = notes
+
+    return _jsonable(item)
 
 
 def build_observations(summary: dict) -> List[dict]:
-    """General, NON-attack facts about the capture, shown separately from security findings.
+    """Create general capture observations, separate from security findings."""
+    summary = summary or {}
+    totals = summary.get("totals") or {}
+    capture = summary.get("capture") or {}
+    tcp = summary.get("tcp") or {}
+    apps = summary.get("application_protocols") or {}
+    data_quality = summary.get("data_quality") or {}
 
-    Return a list of {"level": "info" | "warning", "title": str, "detail": str}.
-    The tests look for these exact titles:
-        "Empty capture"                   (level warning)  when summary["totals"]["packets"] is 0 - return ONLY this one
-        "TCP behaviour"                   connection attempts / resets / retransmissions from summary["tcp"]
-        "Encrypted traffic"               when summary["application_protocols"]["tls_connections"] > 0
-        "No application-layer visibility" (warning) when application_protocols exists but
-                                          packets_with_application_payload is 0 (headers only / all encrypted)
-    Also welcome (pick any): capture size and duration ("duration unavailable" when it is None), protocol mix, busiest sender,
-    peak traffic rate, readable HTTP/FTP/DNS counts, and one "Data quality" warning per truncated / malformed /
-    unsupported count, per summary["data_quality"]["warnings"] text and per ["notes"] text.
-    Use .get() with defaults: a key may be missing or None. Never print "0" for something that is unavailable.
-    """
-    raise NotImplementedError("TODO (Task 3): build_observations()")
+    packet_count = totals.get("packets")
+
+    # An empty capture gets exactly one observation.
+    if packet_count == 0:
+        return [{
+            "level": "warning",
+            "title": "Empty capture",
+            "detail": "No packets were found in this capture.",
+        }]
+
+    observations = []
+
+    # Capture duration.
+    duration = capture.get("duration_seconds")
+    if duration is None:
+        duration_text = "duration unavailable"
+    else:
+        duration_text = f"duration {duration} seconds"
+
+    observations.append({
+        "level": "info",
+        "title": "Capture overview",
+        "detail": (
+            f"Packets: {packet_count if packet_count is not None else 'unavailable'}; "
+            f"captured bytes: "
+            f"{totals.get('captured_bytes') if totals.get('captured_bytes') is not None else 'unavailable'}; "
+            f"{duration_text}."
+        ),
+    })
+
+    # TCP behaviour.
+    tcp_packet_count = tcp.get("packets")
+    attempts = tcp.get("connection_attempts")
+    resets = tcp.get("reset_packets")
+    retransmissions = tcp.get("retransmissions")
+
+    if any(value is not None for value in (
+        tcp_packet_count, attempts, resets, retransmissions
+    )):
+        details = []
+        if attempts is not None:
+            details.append(f"connection attempts: {attempts}")
+        if resets is not None:
+            details.append(f"reset packets: {resets}")
+        if retransmissions is not None:
+            details.append(f"retransmissions: {retransmissions}")
+
+        observations.append({
+            "level": "info",
+            "title": "TCP behaviour",
+            "detail": (
+                "; ".join(details)
+                if details
+                else "TCP statistics are partially unavailable."
+            ),
+        })
+
+    # Encrypted traffic.
+    tls_connections = apps.get("tls_connections")
+    if tls_connections is not None and tls_connections > 0:
+        observations.append({
+            "level": "info",
+            "title": "Encrypted traffic",
+            "detail": (
+                f"The capture reports {tls_connections} TLS connection(s). "
+                "Encrypted content is not readable from packet metadata alone."
+            ),
+        })
+
+    # Application-layer visibility.
+    application_payloads = apps.get("packets_with_application_payload")
+    if application_payloads == 0:
+        observations.append({
+            "level": "warning",
+            "title": "No application-layer visibility",
+            "detail": (
+                "No packets were recorded as containing application-layer payload. "
+                "The capture may contain headers only or encrypted traffic."
+            ),
+        })
+
+    # Data-quality observations.
+    for key, label in (
+        ("truncated", "Truncated packets"),
+        ("malformed", "Malformed packets"),
+        ("unsupported", "Unsupported packets"),
+    ):
+        count = data_quality.get(key)
+        if count is not None and count > 0:
+            observations.append({
+                "level": "warning",
+                "title": "Data quality",
+                "detail": f"{label}: {count}. Some analysis may be incomplete.",
+            })
+
+    for warning in data_quality.get("warnings") or []:
+        observations.append({
+            "level": "warning",
+            "title": "Data quality",
+            "detail": str(warning),
+        })
+
+    for note in data_quality.get("notes") or []:
+        observations.append({
+            "level": "info",
+            "title": "Data quality",
+            "detail": str(note),
+        })
+
+    return observations
 
 
 def build_report(context: dict, findings: List[dict]) -> dict:
-    """Assemble the report described at the top of this file and return ``_jsonable(report)``.
+    """Build the complete JSON-safe report used by the dashboard."""
+    context = context or {}
+    summary = context.get("summary") or {}
+    capture = summary.get("capture") or {}
+    start = capture.get("first_timestamp")
 
-    TODO  1. summary = context.get("summary") or {};  start = summary["capture"]["first_timestamp"] (may be None).
-          2. normalise every finding, sort (severity order, then first_seen; findings without a time go last),
-             then renumber ids F1, F2, ... in the final order.
-          3. Count by severity / classification (include zero counts for every known value).
-          4. Write the headline, collect the observations and fill every key of the report.
-          5. return _jsonable(report)
-    """
-    raise NotImplementedError("TODO (Task 3): build_report()")
+    raw_findings = []
+
+    # Sort raw findings before assigning their final IDs.
+    for raw in findings or []:
+        raw = raw or {}
+        severity = raw.get("severity")
+        if severity not in SEVERITIES:
+            severity = "Low"
+
+        timestamp = raw.get("first_seen")
+
+        # Findings without a timestamp go after timed findings
+        # of the same severity.
+        try:
+            time_missing = timestamp is None
+            sort_time = float(timestamp) if timestamp is not None else 0.0
+        except (TypeError, ValueError, OverflowError):
+            time_missing = True
+            sort_time = 0.0
+
+        raw_findings.append((
+            SEVERITY_ORDER[severity],
+            time_missing,
+            sort_time,
+            raw,
+        ))
+
+    raw_findings.sort(key=lambda row: (row[0], row[1], row[2]))
+
+    normalised = [
+        normalise_finding(row[3], start, index)
+        for index, row in enumerate(raw_findings, start=1)
+    ]
+
+    # Count every supported category, including categories with zero findings.
+    by_severity = {severity: 0 for severity in SEVERITIES}
+    by_classification = {
+        classification: 0 for classification in CLASSIFICATIONS
+    }
+
+    for finding in normalised:
+        by_severity[finding["severity"]] += 1
+        by_classification[finding["classification"]] += 1
+
+    finding_count = len(normalised)
+
+    if finding_count:
+        severity_summary = [
+            f"{count} {severity}"
+            for severity, count in by_severity.items()
+            if count > 0
+        ]
+        headline = (
+            f"{finding_count} finding(s) for review: "
+            + ", ".join(severity_summary)
+            + "."
+        )
+    else:
+        headline = (
+            "No findings were detected. This does not prove that "
+            "the capture is benign or safe."
+        )
+
+    report = {
+        "schema_version": "2.0",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "capture": dict(capture),
+        "headline": headline,
+        "counts": {
+            "findings": finding_count,
+            "by_severity": by_severity,
+            "by_classification": by_classification,
+        },
+        "observations": build_observations(summary),
+        "statistics": summary,
+        "findings": normalised,
+        "rules_run": context.get("rules_run") or [],
+        "rule_errors": context.get("rule_errors") or [],
+        "processing_errors": context.get("processing_errors") or [],
+        "limitations": list(STATIC_LIMITATIONS),
+    }
+
+    return _jsonable(report)
